@@ -63,7 +63,7 @@ func normalizeFlinkType(s string) typeAlias {
 		return charType
 	case "VARCHAR", "STRING":
 		return varCharType
-	case "DECIMAL", "NUMERIC":
+	case "DECIMAL", "DEC", "NUMERIC":
 		return decimal
 	case "DATE":
 		return dateType

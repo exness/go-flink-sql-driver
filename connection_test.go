@@ -3,10 +3,12 @@ package flink
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,11 +20,27 @@ import (
 )
 
 var (
-	jobManager  testcontainers.Container
-	taskManager testcontainers.Container
-	sqlGateway  testcontainers.Container
-	endpoint    string
-	ctx         = context.Background()
+	jobManager    testcontainers.Container
+	taskManager   testcontainers.Container
+	sqlGateway    testcontainers.Container
+	endpoint      string
+	ctx           = context.Background()
+	hostSharedDir string
+)
+
+var (
+	typeOfBool   = reflect.TypeOf(true)
+	typeOfInt64  = reflect.TypeOf(int64(0))
+	typeOfF64    = reflect.TypeOf(float64(0))
+	typeOfBytes  = reflect.TypeOf([]byte(nil))
+	typeOfString = reflect.TypeOf("")
+	typeOfTime   = reflect.TypeOf(time.Time{})
+
+	typeOfNullBool   = reflect.TypeOf(sql.NullBool{})
+	typeOfNullInt    = reflect.TypeOf(sql.NullInt64{})
+	typeOfNullFloat  = reflect.TypeOf(sql.NullFloat64{})
+	typeOfNullString = reflect.TypeOf(sql.NullString{})
+	typeOfNullTime   = reflect.TypeOf(sql.NullTime{})
 )
 
 func TestMain(m *testing.M) {
@@ -32,6 +50,18 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 	defer net.Remove(ctx)
+
+	// Create a host temp dir and mount it into all containers so TaskManagers can write CSV files
+	hostSharedDir, err = os.MkdirTemp("", "flink-e2e-*")
+	if err != nil {
+		fmt.Printf("failed to create temp dir: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.Chmod(hostSharedDir, 0777); err != nil {
+		fmt.Printf("failed to chmod temp dir: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Using shared host dir: %s\n", hostSharedDir)
 
 	// JobManager
 	jobManager, err = testcontainers.GenericContainer(ctx,
@@ -50,6 +80,9 @@ func TestMain(m *testing.M) {
 				WaitingFor: wait.ForHTTP("/").
 					WithPort("8081/tcp").
 					WithStartupTimeout(2 * time.Minute),
+				HostConfigModifier: func(hc *container.HostConfig) {
+					hc.Binds = append(hc.Binds, fmt.Sprintf("%s:%s", hostSharedDir, "/shared"))
+				},
 			},
 			Started: true,
 		})
@@ -71,6 +104,9 @@ func TestMain(m *testing.M) {
 				Cmd: []string{"taskmanager"},
 				ConfigModifier: func(cfg *container.Config) {
 					cfg.Hostname = "taskmanager"
+				},
+				HostConfigModifier: func(hc *container.HostConfig) {
+					hc.Binds = append(hc.Binds, fmt.Sprintf("%s:%s", hostSharedDir, "/shared"))
 				},
 			},
 			Started: true,
@@ -95,6 +131,9 @@ func TestMain(m *testing.M) {
 				WaitingFor: wait.ForHTTP("/info").
 					WithPort("8083/tcp").
 					WithStartupTimeout(2 * time.Minute),
+				HostConfigModifier: func(hc *container.HostConfig) {
+					hc.Binds = append(hc.Binds, fmt.Sprintf("%s:%s", hostSharedDir, "/shared"))
+				},
 			},
 			Started: true,
 		})
@@ -125,11 +164,13 @@ func TestMain(m *testing.M) {
 	sqlGateway.Terminate(ctx)
 	net.Remove(ctx)
 
+	_ = os.RemoveAll(hostSharedDir)
 	os.Exit(code)
 }
 
-func TestFlinkConn_EndToEnd_SelectAllTypesNotNull(t *testing.T) {
-	// 1) Create connector and open a connection (flinkConn)
+// openStreamingDB creates a DB with STREAMING runtime mode and returns a cleanup func.
+func openStreamingDB(t *testing.T) (*sql.DB, func()) {
+	t.Helper()
 	connector, _ := NewConnector(
 		WithGatewayURL(endpoint),
 		WithProperties(map[string]string{
@@ -137,13 +178,218 @@ func TestFlinkConn_EndToEnd_SelectAllTypesNotNull(t *testing.T) {
 		}),
 	)
 	db := sql.OpenDB(connector)
-
-	defer func() {
+	cleanup := func() {
 		if cerr := db.Close(); cerr != nil {
 			t.Logf("close db: %v", cerr)
 		}
-	}()
+	}
+	return db, cleanup
+}
 
+func execDDL(t *testing.T, db *sql.DB, ddl string) {
+	t.Helper()
+	res, err := db.ExecContext(ctx, ddl)
+	if err != nil {
+		t.Fatalf("ExecContext(DDL) failed: %v", err)
+	}
+	if rows, _ := res.RowsAffected(); rows != 0 {
+		t.Fatalf("ExecContext(DDL) expected 0 rows affected, got %d", rows)
+	}
+}
+
+// assertTypesFromQuery runs a query with timeout and validates column Go types.
+func assertTypesFromQuery(t *testing.T, db *sql.DB, query string, expected map[string][]reflect.Type, timeout time.Duration) {
+	t.Helper()
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	rows, err := db.QueryContext(cctx, query)
+	if err != nil {
+		t.Fatalf("QueryContext(%s) failed: %v", query, err)
+	}
+	cols, err := rows.Columns()
+	if err != nil {
+		t.Fatalf("Columns() failed: %v", err)
+	}
+	for rows.Next() {
+		dest := make([]any, len(cols))
+		scanArgs := make([]any, len(cols))
+		for i := range dest {
+			scanArgs[i] = &dest[i]
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
+			t.Fatalf("Scan failed: %v", err)
+		}
+		for i, name := range cols {
+			lname := strings.ToLower(strings.TrimSpace(name))
+			allowed, ok := expected[lname]
+			if !ok {
+				continue
+			}
+			got := reflect.TypeOf(dest[i])
+			okType := false
+			for _, a := range allowed {
+				if got == a {
+					okType = true
+					break
+				}
+			}
+			if !okType {
+				t.Fatalf("column %q: got Go type %v (value=%v), want one of %v", name, got, dest[i], allowed)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		if !errors.Is(cctx.Err(), context.DeadlineExceeded) { // deadline cancel is expected
+			t.Fatalf("rows.Err(): %v", err)
+		}
+	}
+}
+
+// ---- Filesystem test helpers ----
+func getNullInt(v any) int64 {
+	switch x := v.(type) {
+	case sql.NullInt64:
+		if x.Valid {
+			return x.Int64
+		}
+	case int64:
+		return x
+	}
+	return 0
+}
+func getNullString(v any) string {
+	switch x := v.(type) {
+	case sql.NullString:
+		if x.Valid {
+			return x.String
+		}
+	case string:
+		return x
+	}
+	return ""
+}
+func getNullTime(v any) time.Time {
+	switch x := v.(type) {
+	case sql.NullTime:
+		if x.Valid {
+			return x.Time
+		}
+	case time.Time:
+		return x
+	case string:
+		if ts, err := time.Parse(time.RFC3339Nano, x); err == nil {
+			return ts
+		}
+	}
+	return time.Time{}
+}
+
+func normalizeFSRow(r []any) string {
+	if len(r) != 7 {
+		return fmt.Sprintf("len=%d row=%v", len(r), r)
+	}
+	id := getNullInt(r[0])
+	val := getNullInt(r[1])
+	strv := getNullString(r[2])
+	ts1 := getNullTime(r[3]).UTC().Format("2006-01-02 15:04:05")
+	ts2 := getNullTime(r[4]).UTC().Format("2006-01-02 15:04:05.000")
+	tOnly := getNullTime(r[5]).Format("15:04:05")
+	dOnly := getNullTime(r[6]).Format("2006-01-02")
+	return fmt.Sprintf("id=%d,val=%d,str=%s,t1=%s,t2=%s,time=%s,date=%s", id, val, strv, ts1, ts2, tOnly, dOnly)
+}
+
+func toSet(rows [][]any, normalize func([]any) string) map[string]struct{} {
+	set := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		set[normalize(r)] = struct{}{}
+	}
+	return set
+}
+
+func assertSetEqual(t *testing.T, got, want map[string]struct{}) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("row count mismatch: got=%d want=%d\nGOT=%v\nWANT=%v", len(got), len(want), got, want)
+	}
+	for s := range want {
+		if _, ok := got[s]; !ok {
+			t.Fatalf("missing expected row: %s\nGotSet=%v", s, got)
+		}
+	}
+}
+
+// ---- Custom Scanner types for complex columns ----
+
+type RowInfo struct {
+	Score int    `json:"score"`
+	Label string `json:"label"`
+}
+
+// Scan implements sql.Scanner to accept either JSON bytes or JSON string representing the ROW value.
+func (r *RowInfo) Scan(src any) error {
+	var b []byte
+	switch v := src.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		return fmt.Errorf("RowInfo.Scan: unsupported src type %T", src)
+	}
+	// Some connectors may wrap inner quotes; trim whitespace first.
+	b = []byte(strings.TrimSpace(string(b)))
+	return json.Unmarshal(b, r)
+}
+
+// StringMap scans a JSON object into a map[string]string with stable comparison helpers.
+// It implements sql.Scanner so database/sql can populate it directly.
+type StringMap map[string]string
+
+func (m *StringMap) Scan(src any) error {
+	var b []byte
+	switch v := src.(type) {
+	case []byte:
+		b = v
+	case string:
+		b = []byte(v)
+	default:
+		return fmt.Errorf("StringMap.Scan: unsupported src type %T", src)
+	}
+	b = []byte(strings.TrimSpace(string(b)))
+	var tmp map[string]string
+	if err := json.Unmarshal(b, &tmp); err != nil {
+		return err
+	}
+	*m = tmp
+	return nil
+}
+
+func (m StringMap) Canonical() string {
+	if m == nil {
+		return "{}"
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, k := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, m[k]))
+	}
+	return "{" + strings.Join(parts, ",") + "}"
+}
+
+func (r RowInfo) Canonical() string {
+	return fmt.Sprintf("score=%d,label=%s", r.Score, r.Label)
+}
+
+func TestFlinkConn_EndToEnd_SelectAllTypesNotNull(t *testing.T) {
+	// 1) Open DB
+	db, cleanup := openStreamingDB(t)
+	defer cleanup()
+
+	// 2) Create source table
 	createTable := `CREATE TABLE test_table (
 		bool BOOLEAN NOT NULL, 
 		num SMALLINT NOT NULL,
@@ -164,55 +410,23 @@ func TestFlinkConn_EndToEnd_SelectAllTypesNotNull(t *testing.T) {
 		tmstpwotz TIMESTAMP NOT NULL,
 		row1 ROW<int1 INTEGER NOT NULL, int2 INTEGER, str1 STRING NOT NULL, nested_row_not_null ROW<str2 STRING, int4 INT NOT NULL> NOT NULL, nested_row_null ROW<int5 int not null>> NOT NULL,
 		map1 MAP<STRING, INT> NOT NULL
-		// TODO "array1 ARRAY<INT> NOT NULL
-		// TODO ms "MULTISET<INT NOT NULL> NOT NULL
 		) WITH (
 		'connector' = 'datagen',
 		'rows-per-second' = '5'
 	)`
+	execDDL(t, db, createTable)
 
-	result, err := db.ExecContext(ctx, createTable)
-	if err != nil {
-		t.Fatalf("ExecContext(create table) failed: %v", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected != 0 {
-		t.Fatalf("ExecContext(create table) expected 0 rows affected, got %d", rowsAffected)
-	}
-
-	ctx3, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	rows, err := db.QueryContext(ctx3, "SELECT * from test_table")
-	if err != nil {
-		t.Fatalf("QueryContext(SELECT * from test_table) failed: %v", err)
-	}
-
-	// Validate types for at least the first row; the 3s context will cancel the stream gracefully.
-	cols, err := rows.Columns()
-	if err != nil {
-		t.Fatalf("Columns() failed: %v", err)
-	}
-
-	// Build expected Go types per column (NOT NULL schema).
-	typeOfBool := reflect.TypeOf(true)
-	typeOfInt64 := reflect.TypeOf(int64(0))
-	typeOfF64 := reflect.TypeOf(float64(0))
-	typeOfBytes := reflect.TypeOf([]byte(nil))
-	typeOfString := reflect.TypeOf("")
-	typeOfTime := reflect.TypeOf(time.Time{})
-
+	// 3) Expected Go types per column (NOT NULL schema)
 	expected := map[string][]reflect.Type{
-		"bool": {typeOfBool},
-		"num":  {typeOfInt64}, // SMALLINT
-		"dbl":  {typeOfF64},   // DOUBLE
-		"bin":  {typeOfBytes}, // BINARY
-		"vbin": {typeOfBytes}, // VARBINARY
-		"chr":  {typeOfString},
-		"vchr": {typeOfString},
-		// Allow time-ish values to be time.Time or string/[]byte depending on driver formatting.
-		"tmstp": {typeOfTime}, // TIMESTAMP_LTZ
-		"dte":   {typeOfTime}, // DATE
-		// Decimal: allow string or bytes; some gateways may surface float64.
+		"bool":      {typeOfBool},
+		"num":       {typeOfInt64}, // SMALLINT
+		"dbl":       {typeOfF64},   // DOUBLE
+		"bin":       {typeOfBytes}, // BINARY
+		"vbin":      {typeOfBytes}, // VARBINARY
+		"chr":       {typeOfString},
+		"vchr":      {typeOfString},
+		"tmstp":     {typeOfTime}, // TIMESTAMP_LTZ
+		"dte":       {typeOfTime}, // DATE
 		"dcml":      {typeOfString},
 		"tint":      {typeOfInt64}, // TINYINT
 		"sint":      {typeOfInt64}, // SMALLINT
@@ -221,70 +435,20 @@ func TestFlinkConn_EndToEnd_SelectAllTypesNotNull(t *testing.T) {
 		"bgint":     {typeOfInt64}, // BIGINT
 		"flt":       {typeOfF64},   // FLOAT
 		"tmstpwotz": {typeOfTime},
-		// Complex types may be surfaced as JSON-encoded []byte or string
-		"row1": {typeOfBytes, typeOfString},
-		"map1": {typeOfBytes, typeOfString},
+		"row1":      {typeOfBytes},
+		"map1":      {typeOfBytes},
 	}
 
-	for rows.Next() {
-		// Scan current row
-		dest := make([]any, len(cols))
-		scanArgs := make([]any, len(cols))
-		for i := range dest {
-			scanArgs[i] = &dest[i]
-		}
-		if err := rows.Scan(scanArgs...); err != nil {
-			t.Fatalf("Scan failed: %v", err)
-		}
-
-		// Check each column's Go type against expectations
-		for i, name := range cols {
-			lname := strings.ToLower(strings.TrimSpace(name))
-			allowed, ok := expected[lname]
-			if !ok {
-				// If we somehow don't have an expectation, just continue
-				continue
-			}
-			got := reflect.TypeOf(dest[i])
-			match := false
-			for _, a := range allowed {
-				if got == a {
-					match = true
-					break
-				}
-			}
-			if !match {
-				t.Fatalf("column %q: got Go type %v (value=%v), want one of %v", name, got, dest[i], allowed)
-			}
-		}
-	}
-
-	// Handle end-of-rows or timeout gracefully
-	if err := rows.Err(); err != nil {
-		// If the context timed out, that's expected; otherwise fail.
-		if !errors.Is(ctx3.Err(), context.DeadlineExceeded) {
-			t.Fatalf("rows.Err(): %v", err)
-		}
-	}
-
+	// 4) Validate
+	assertTypesFromQuery(t, db, "SELECT * from test_table", expected, 3*time.Second)
 }
 
 func TestFlinkConn_EndToEnd_SelectAllTypesNullable(t *testing.T) {
-	// 1) Create connector and open a connection (flinkConn)
-	connector, _ := NewConnector(
-		WithGatewayURL(endpoint),
-		WithProperties(map[string]string{
-			"execution.runtime-mode": "STREAMING",
-		}),
-	)
-	db := sql.OpenDB(connector)
+	// 1) Open DB
+	db, cleanup := openStreamingDB(t)
+	defer cleanup()
 
-	defer func() {
-		if cerr := db.Close(); cerr != nil {
-			t.Logf("close db: %v", cerr)
-		}
-	}()
-
+	// 2) Create source table
 	createTable := `CREATE TABLE test_table_nullable (
 		bool BOOLEAN,
 		num SMALLINT,
@@ -309,38 +473,9 @@ func TestFlinkConn_EndToEnd_SelectAllTypesNullable(t *testing.T) {
 		'connector' = 'datagen',
 		'rows-per-second' = '5'
 	)`
+	execDDL(t, db, createTable)
 
-	result, err := db.ExecContext(ctx, createTable)
-	if err != nil {
-		t.Fatalf("ExecContext(create table) failed: %v", err)
-	}
-	rowsAffected, _ := result.RowsAffected()
-	if rowsAffected != 0 {
-		t.Fatalf("ExecContext(create table) expected 0 rows affected, got %d", rowsAffected)
-	}
-
-	ctx3, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-	rows, err := db.QueryContext(ctx3, "SELECT * from test_table_nullable")
-	if err != nil {
-		t.Fatalf("QueryContext(SELECT * from test_table_nullable) failed: %v", err)
-	}
-
-	// Validate types for at least the first row; the 3s context will cancel the stream gracefully.
-	cols, err := rows.Columns()
-	if err != nil {
-		t.Fatalf("Columns() failed: %v", err)
-	}
-
-	// Build expected Go types per column (ALL NULLABLE schema).
-	typeOfNullBool := reflect.TypeOf(sql.NullBool{})
-	typeOfNullInt := reflect.TypeOf(sql.NullInt64{})
-	typeOfNullFloat := reflect.TypeOf(sql.NullFloat64{})
-	typeOfNullString := reflect.TypeOf(sql.NullString{})
-	typeOfNullTime := reflect.TypeOf(sql.NullTime{})
-	typeOfBytes := reflect.TypeOf([]byte(nil))
-	typeOfString := reflect.TypeOf("")
-
+	// 3) Expected Go types per column (ALL NULLABLE schema)
 	expected := map[string][]reflect.Type{
 		"bool":      {typeOfNullBool},
 		"num":       {typeOfNullInt},    // SMALLINT -> sql.NullInt64
@@ -359,55 +494,15 @@ func TestFlinkConn_EndToEnd_SelectAllTypesNullable(t *testing.T) {
 		"bgint":     {typeOfNullInt},    // BIGINT -> sql.NullInt64
 		"flt":       {typeOfNullFloat},  // FLOAT -> sql.NullFloat64
 		"tmstpwotz": {typeOfNullTime},   // TIMESTAMP -> sql.NullTime
-		// Complex types may be surfaced as JSON-encoded []byte or string
-		"row1": {typeOfBytes, typeOfString},
-		"map1": {typeOfBytes, typeOfString},
+		"row1":      {typeOfBytes},
+		"map1":      {typeOfBytes},
 	}
 
-	for rows.Next() {
-		// Scan current row
-		dest := make([]any, len(cols))
-		scanArgs := make([]any, len(cols))
-		for i := range dest {
-			scanArgs[i] = &dest[i]
-		}
-		if err := rows.Scan(scanArgs...); err != nil {
-			t.Fatalf("Scan failed: %v", err)
-		}
-
-		// Check each column's Go type against expectations
-		for i, name := range cols {
-			lname := strings.ToLower(strings.TrimSpace(name))
-			allowed, ok := expected[lname]
-			if !ok {
-				// If we somehow don't have an expectation, just continue
-				continue
-			}
-			got := reflect.TypeOf(dest[i])
-			match := false
-			for _, a := range allowed {
-				if got == a {
-					match = true
-					break
-				}
-			}
-			if !match {
-				t.Fatalf("column %q: got Go type %v (value=%v), want one of %v", name, got, dest[i], allowed)
-			}
-		}
-	}
-
-	// Handle end-of-rows or timeout gracefully
-	if err := rows.Err(); err != nil {
-		// If the context timed out, that's expected; otherwise fail.
-		if !errors.Is(ctx3.Err(), context.DeadlineExceeded) {
-			t.Fatalf("rows.Err(): %v", err)
-		}
-	}
+	// 4) Validate
+	assertTypesFromQuery(t, db, "SELECT * from test_table_nullable", expected, 3*time.Second)
 }
 
 // readAllRows drains *sql.Rows and returns a copy of all values.
-// It also ensures rows.Close() is called.
 func readAllRows(rows *sql.Rows) ([][]any, error) {
 	defer rows.Close()
 
@@ -436,31 +531,7 @@ func readAllRows(rows *sql.Rows) ([][]any, error) {
 	return out, nil
 }
 
-// timeOfDaySuffix extracts "HH:MM:SS" for a timestamp-ish value coming back from the driver.
-// It supports time.Time, string (various layouts), and []byte (string-encoded).
-func timeOfDaySuffix(v any) string {
-	switch x := v.(type) {
-	case time.Time:
-		return x.Format("15:04:05")
-	case string:
-		s := strings.TrimSpace(x)
-		if len(s) >= 8 {
-			return s[len(s)-8:]
-		}
-		return s
-	case []byte:
-		s := strings.TrimSpace(string(x))
-		if len(s) >= 8 {
-			return s[len(s)-8:]
-		}
-		return s
-	default:
-		return fmt.Sprintf("%v", x)
-	}
-}
-
-// awaitAtLeastOneFinishedJob polls "SHOW JOBS" until it finds any row whose status/state is FINISHED.
-func awaitAtLeastOneFinishedJob(db *sql.DB, timeout time.Duration, interval time.Duration) error {
+func awaitNewJobFinished(db *sql.DB, timeout time.Duration, interval time.Duration) (string, error) {
 	deadline := time.Now().Add(timeout)
 
 	for time.Now().Before(deadline) {
@@ -470,213 +541,43 @@ func awaitAtLeastOneFinishedJob(db *sql.DB, timeout time.Duration, interval time
 			continue
 		}
 
-		cols, err := rows.Columns()
-		if err != nil {
-			rows.Close()
-			time.Sleep(interval)
-			continue
-		}
-
-		all, err := readAllRows(rows)
-		if err != nil {
-			time.Sleep(interval)
-			continue
-		}
-		if len(all) == 0 {
-			time.Sleep(interval)
-			continue
-		}
-
-		statusIdx := -1
-		for i, c := range cols {
-			s := strings.ToLower(strings.TrimSpace(c))
-			if s == "status" || s == "state" {
-				statusIdx = i
-				break
-			}
-		}
-		if statusIdx == -1 {
-			if len(cols) >= 3 {
-				statusIdx = 2
-			} else if len(cols) >= 1 {
-				statusIdx = len(cols) - 1
-			}
-		}
-
-		for _, r := range all {
-			if statusIdx >= 0 && statusIdx < len(r) {
-				status := strings.ToUpper(strings.TrimSpace(fmt.Sprint(r[statusIdx])))
-				if status == "FINISHED" {
-					return nil
-				}
-			}
-		}
-		time.Sleep(interval)
-	}
-	return fmt.Errorf("no FINISHED job observed within %s", timeout)
-}
-
-func getJobIDs(db *sql.DB) (map[string]struct{}, error) {
-	rows, err := db.QueryContext(ctx, "SHOW JOBS")
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	all, err := readAllRows(rows)
-	if err != nil {
-		return nil, err
-	}
-
-	fmt.Println("columns:", cols)
-	fmt.Println("rows:", all)
-
-	// Find a likely job id column (usually the first)
-	idIdx := 0
-
-	out := make(map[string]struct{})
-	for _, r := range all {
-		id := strings.TrimSpace(fmt.Sprint(r[idIdx]))
-		out[id] = struct{}{}
-	}
-	fmt.Println("idIdx:", idIdx)
-	fmt.Println("out: ", out)
-	return out, nil
-}
-
-func awaitNewJobFinished(db *sql.DB, before map[string]struct{}, timeout time.Duration, interval time.Duration) (string, error) {
-	deadline := time.Now().Add(timeout)
-
-	for time.Now().Before(deadline) {
-		rows, err := db.QueryContext(ctx, "SHOW JOBS")
-		if err != nil {
-			time.Sleep(interval)
-			continue
-		}
-
-		cols, err := rows.Columns()
-		if err == nil {
-			fmt.Println("columns:", cols)
-		}
-
-		colTypes, err := rows.ColumnTypes()
-		if err == nil {
-			var b strings.Builder
-			fmt.Fprintln(&b, "col types:")
-			for i, ct := range colTypes {
-				if ct == nil {
-					fmt.Fprintf(&b, "  [%d] <nil>\n", i)
-					continue
-				}
-				name := ct.Name()
-				dbt := ct.DatabaseTypeName()
-				length, lengthOK := ct.Length()
-				nullable, nullableOK := ct.Nullable()
-				precision, scale, decOK := ct.DecimalSize()
-				scanType := ct.ScanType()
-
-				fmt.Fprintf(&b, "  [%d] Name=%q DBType=%q", i, name, dbt)
-				if lengthOK {
-					fmt.Fprintf(&b, " Length=%d", length)
-				}
-				if decOK {
-					fmt.Fprintf(&b, " Precision=%d Scale=%d", precision, scale)
-				}
-				if nullableOK {
-					fmt.Fprintf(&b, " Nullable=%t", nullable)
-				}
-				if scanType != nil {
-					fmt.Fprintf(&b, " ScanType=%v", scanType)
-				}
-				fmt.Fprintln(&b)
-			}
-			fmt.Print(b.String())
-		} else {
-			fmt.Println("col types error:", err)
-		}
-
 		all, err := readAllRows(rows)
 		if err != nil {
 			time.Sleep(interval)
 			continue
 		}
 
-		fmt.Println("All new jobs:", all)
-
-		// Identify columns
 		idIdx := 0
 		statusIdx := 2
 
 		for _, r := range all {
-			var jid string
-			switch v := r[idIdx].(type) {
-			case sql.NullString:
-				if v.Valid {
-					jid = v.String
-				}
-			default:
-				jid = strings.TrimSpace(fmt.Sprint(v))
+			jobIdNullable := r[idIdx].(sql.NullString)
+			jobStatusNullable := r[statusIdx].(sql.NullString)
+			var jobId string
+			if jobIdNullable.Valid {
+				jobId = jobIdNullable.String
 			}
-
-			var status string
-			switch v := r[statusIdx].(type) {
-			case sql.NullString:
-				if v.Valid {
-					status = v.String
-				}
-			default:
-				status = strings.TrimSpace(fmt.Sprint(v))
+			var jobStatus string
+			if jobStatusNullable.Valid {
+				jobStatus = strings.ToUpper(jobStatusNullable.String)
 			}
-
-			status = strings.ToUpper(status)
-
-			fmt.Println("jid:", jid, "status:", status)
-			if status == "FINISHED" {
-				return jid, nil
+			if jobStatus == "FINISHED" {
+				return jobId, nil
 			}
 		}
-
 		time.Sleep(interval)
 	}
 	return "", fmt.Errorf("no new FINISHED job observed within %s", timeout)
 }
 
 func TestFlinkConn_EndToEnd_FilesystemInsertSelect(t *testing.T) {
-	// Prepare connector and DB
-	connector, _ := NewConnector(
-		WithGatewayURL(endpoint),
-		WithProperties(map[string]string{
-			"execution.runtime-mode": "STREAMING",
-		}),
-	)
-	db := sql.OpenDB(connector)
-	defer func() {
-		if cerr := db.Close(); cerr != nil {
-			t.Logf("close db: %v", cerr)
-		}
-	}()
+	// 1) Open DB
+	db, cleanup := openStreamingDB(t)
+	defer cleanup()
 
-	dir := fmt.Sprintf("file:///tmp/test_table_%d", time.Now().UnixNano())
-
-	// Ensure the target directory exists inside the containers and is writable by 'flink'
-	localDir := strings.TrimPrefix(dir, "file://")
-	ensureDir := func(c testcontainers.Container, name string) {
-		exitCode, err, _ := c.Exec(ctx, []string{"sh", "-lc", fmt.Sprintf("mkdir -p %s && chmod 777 %s", localDir, localDir)})
-		if err != nil || exitCode != 0 {
-			t.Logf("warn: failed to ensure dir on %s: err=%v exit=%d", name, err, exitCode)
-		} else {
-			t.Logf("ensured %s exists on %s", localDir, name)
-		}
-	}
-	ensureDir(jobManager, "jobmanager")
-	ensureDir(taskManager, "taskmanager")
-	ensureDir(sqlGateway, "sql-gateway")
-
+	// 2) Create filesystem table writing under shared mount
+	containerDir := fmt.Sprintf("/shared/test_table_%d", time.Now().UnixNano())
+	dir := "file://" + containerDir
 	ddl := fmt.Sprintf(
 		"CREATE TABLE test_table(\n"+
 			"  id BIGINT,\n"+
@@ -693,30 +594,22 @@ func TestFlinkConn_EndToEnd_FilesystemInsertSelect(t *testing.T) {
 			")",
 		dir,
 	)
+	execDDL(t, db, ddl)
 
-	if _, err := db.ExecContext(ctx, ddl); err != nil {
-		t.Fatalf("create table failed: %v", err)
-	}
-
-	// Capture job IDs before INSERT
-	beforeIDs, _ := getJobIDs(db)
-
+	// 3) Insert rows
 	insertSQL := "INSERT INTO test_table VALUES " +
 		"(1, 11, '111', TIMESTAMP '2021-04-15 23:18:36', TO_TIMESTAMP_LTZ(400000000000, 3), TIME '12:32:00', DATE '2023-11-02'), " +
 		"(3, 33, '333', TIMESTAMP '2021-04-16 23:18:36', TO_TIMESTAMP_LTZ(500000000000, 3), TIME '13:32:00', DATE '2023-12-02'), " +
 		"(2, 22, '222', TIMESTAMP '2021-04-17 23:18:36', TO_TIMESTAMP_LTZ(600000000000, 3), TIME '14:32:00', DATE '2023-01-02'), " +
 		"(4, 44, '444', TIMESTAMP '2021-04-18 23:18:36', TO_TIMESTAMP_LTZ(700000000000, 3), TIME '15:32:00', DATE '2023-02-02')"
-
 	if _, err := db.ExecContext(ctx, insertSQL); err != nil {
 		t.Fatalf("insert failed: %v", err)
 	}
-
-	// Wait for the specific new INSERT job to finish
-	if _, err := awaitNewJobFinished(db, beforeIDs, 2*time.Minute, 2*time.Second); err != nil {
+	if _, err := awaitNewJobFinished(db, 2*time.Minute, 2*time.Second); err != nil {
 		t.Fatalf("await insert job finished: %v", err)
 	}
 
-	// Now SELECT the data back and compare (order-insensitive)
+	// 4) Read back and compare as unordered set
 	rows, err := db.QueryContext(ctx, "SELECT * FROM test_table")
 	if err != nil {
 		t.Fatalf("select failed: %v", err)
@@ -726,71 +619,8 @@ func TestFlinkConn_EndToEnd_FilesystemInsertSelect(t *testing.T) {
 		t.Fatalf("drain rows failed: %v", err)
 	}
 
-	fmt.Println("data:", data)
+	gotSet := toSet(data, normalizeFSRow)
 
-	// Normalize actual rows into comparable strings
-	normalize := func(r []any) string {
-		if len(r) != 7 {
-			return fmt.Sprintf("len=%d row=%v", len(r), r)
-		}
-
-		// Helper extractors for nullable types
-		getNullInt := func(v any) int64 {
-			switch x := v.(type) {
-			case sql.NullInt64:
-				if x.Valid {
-					return x.Int64
-				}
-			case int64:
-				return x
-			}
-			return 0
-		}
-		getNullString := func(v any) string {
-			switch x := v.(type) {
-			case sql.NullString:
-				if x.Valid {
-					return x.String
-				}
-			case string:
-				return x
-			}
-			return ""
-		}
-		getNullTime := func(v any) time.Time {
-			switch x := v.(type) {
-			case sql.NullTime:
-				if x.Valid {
-					return x.Time
-				}
-			case time.Time:
-				return x
-			case string:
-				// best-effort parse common layouts
-				if ts, err := time.Parse(time.RFC3339Nano, x); err == nil {
-					return ts
-				}
-			}
-			return time.Time{}
-		}
-
-		id := getNullInt(r[0])
-		val := getNullInt(r[1])
-		strv := getNullString(r[2])
-		ts1 := getNullTime(r[3]).UTC().Format("2006-01-02 15:04:05")
-		ts2 := getNullTime(r[4]).UTC().Format("2006-01-02 15:04:05.000")
-		tOnly := getNullTime(r[5]).Format("15:04:05")
-		dOnly := getNullTime(r[6]).Format("2006-01-02")
-
-		return fmt.Sprintf("id=%d,val=%d,str=%s,t1=%s,t2=%s,time=%s,date=%s", id, val, strv, ts1, ts2, tOnly, dOnly)
-	}
-
-	gotSet := make(map[string]struct{})
-	for _, r := range data {
-		gotSet[normalize(r)] = struct{}{}
-	}
-
-	// Build expected set
 	exp := []struct {
 		id  int64
 		val int64
@@ -805,7 +635,6 @@ func TestFlinkConn_EndToEnd_FilesystemInsertSelect(t *testing.T) {
 		{2, 22, "222", "2021-04-17 23:18:36", time.UnixMilli(600000000000).UTC(), "14:32:00", "2023-01-02"},
 		{4, 44, "444", "2021-04-18 23:18:36", time.UnixMilli(700000000000).UTC(), "15:32:00", "2023-02-02"},
 	}
-
 	wantSet := make(map[string]struct{})
 	for _, e := range exp {
 		s := fmt.Sprintf(
@@ -815,13 +644,84 @@ func TestFlinkConn_EndToEnd_FilesystemInsertSelect(t *testing.T) {
 		wantSet[s] = struct{}{}
 	}
 
-	if len(gotSet) != len(wantSet) {
-		t.Fatalf("row count mismatch: got=%d want=%d\nGOT=%v\nWANT=%v", len(gotSet), len(wantSet), gotSet, wantSet)
+	assertSetEqual(t, gotSet, wantSet)
+}
+
+func TestFlinkConn_Filesystem_RowAndMap_ScanIntoStructAndMap(t *testing.T) {
+	// 1) Open DB
+	db, cleanup := openStreamingDB(t)
+	defer cleanup()
+
+	// 2) Create filesystem table with ROW and MAP columns
+	containerDir := fmt.Sprintf("/shared/csv_complex_%d", time.Now().UnixNano())
+	dir := "file://" + containerDir
+	ddl := fmt.Sprintf(
+		"CREATE TABLE csv_complex(\n"+
+			"  id BIGINT NOT NULL,\n"+
+			"  name STRING NOT NULL,\n"+
+			"  info ROW<score INT, label STRING> NOT NULL,\n"+
+			"  `attrs` MAP<STRING, STRING> NOT NULL"+
+			") WITH (\n"+
+			"  'connector'='filesystem',\n"+
+			"  'format'='csv',\n"+
+			"  'path'='%s'\n"+
+			")",
+		dir,
+	)
+	execDDL(t, db, ddl)
+
+	// 3) Insert rows using ROW(...) and STR_TO_MAP constructors
+	insertSQL := "INSERT INTO csv_complex VALUES " +
+		"(1, 'alpha', ROW(10, 'A'), STR_TO_MAP('k1=1,k2=2'))," +
+		"(2, 'beta',  ROW(20, 'B'), STR_TO_MAP('x=9'))"
+	if _, err := db.ExecContext(ctx, insertSQL); err != nil {
+		t.Fatalf("insert failed: %v", err)
+	}
+	if _, err := awaitNewJobFinished(db, 2*time.Minute, 2*time.Second); err != nil {
+		t.Fatalf("await insert job finished: %v", err)
 	}
 
-	for s := range wantSet {
-		if _, ok := gotSet[s]; !ok {
-			t.Fatalf("missing expected row: %s\nGotSet=%v", s, gotSet)
-		}
+	// 4) Select and scan into struct and custom map
+	rows, err := db.QueryContext(ctx, "SELECT id, name, info, attrs FROM csv_complex")
+	if err != nil {
+		t.Fatalf("select failed: %v", err)
 	}
+	defer rows.Close()
+
+	type rec struct {
+		id    int64
+		name  string
+		info  RowInfo
+		attrs StringMap
+	}
+	var got []rec
+	for rows.Next() {
+		var r rec
+		if err := rows.Scan(&r.id, &r.name, &r.info, &r.attrs); err != nil {
+			t.Fatalf("scan failed: %v", err)
+		}
+		got = append(got, r)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows err: %v", err)
+	}
+
+	// Build canonical sets for comparison (order-insensitive)
+	gotSet := make(map[string]struct{}, len(got))
+	for _, r := range got {
+		key := fmt.Sprintf("id=%d|name=%s|info={%s}|attrs=%s", r.id, r.name, r.info.Canonical(), r.attrs.Canonical())
+		gotSet[key] = struct{}{}
+	}
+
+	want := []rec{
+		{id: 1, name: "alpha", info: RowInfo{Score: 10, Label: "A"}, attrs: StringMap{"k1": "1", "k2": "2"}},
+		{id: 2, name: "beta", info: RowInfo{Score: 20, Label: "B"}, attrs: StringMap{"x": "9"}},
+	}
+	wantSet := make(map[string]struct{}, len(want))
+	for _, r := range want {
+		key := fmt.Sprintf("id=%d|name=%s|info={%s}|attrs=%s", r.id, r.name, r.info.Canonical(), r.attrs.Canonical())
+		wantSet[key] = struct{}{}
+	}
+
+	assertSetEqual(t, gotSet, wantSet)
 }

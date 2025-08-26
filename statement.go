@@ -8,6 +8,7 @@ import (
 type flinkStmt struct {
 	conn  *flinkConn
 	query string
+	ctx   context.Context
 }
 
 func (s *flinkStmt) Close() error {
@@ -15,6 +16,7 @@ func (s *flinkStmt) Close() error {
 }
 
 func (s *flinkStmt) NumInput() int {
+	// todo
 	return -1
 }
 
@@ -31,7 +33,7 @@ func (s *flinkStmt) Exec(args []driver.Value) (driver.Result, error) {
 	for i, v := range args {
 		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
 	}
-	return s.ExecContext(context.Background(), named)
+	return s.ExecContext(s.ctx, named)
 }
 
 func (s *flinkStmt) Query(args []driver.Value) (driver.Rows, error) {
@@ -39,5 +41,5 @@ func (s *flinkStmt) Query(args []driver.Value) (driver.Rows, error) {
 	for i, v := range args {
 		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
 	}
-	return s.QueryContext(context.Background(), named)
+	return s.QueryContext(s.ctx, named)
 }

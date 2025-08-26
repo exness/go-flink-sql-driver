@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"path"
@@ -33,6 +32,25 @@ const (
 	ResultKindSuccessWithContent ResultKind = "SUCCESS_WITH_CONTENT"
 )
 
+// GatewayClient is the minimal interface implemented by *Client.
+// It allows consumers to depend on an interface for easier testing/mocking.
+type GatewayClient interface {
+	GetInfo(ctx context.Context) (*InfoResponse, error)
+	GetAPIVersions(ctx context.Context) ([]string, error)
+	OpenSession(ctx context.Context, reqBody *OpenSessionRequest) (string, error)
+	CloseSession(ctx context.Context, sessionHandle string) error
+	GetSessionConfig(ctx context.Context, sessionHandle string) (map[string]string, error)
+	CompleteStatement(ctx context.Context, sessionHandle string, reqBody *CompleteStatementRequest) ([]string, error)
+	ConfigureSession(ctx context.Context, sessionHandle string, reqBody *ConfigureSessionRequest) error
+	Heartbeat(ctx context.Context, sessionHandle string) error
+	RefreshMaterializedTable(ctx context.Context, sessionHandle, identifier string, reqBody *RefreshMaterializedTableRequest) (string, error)
+	CancelOperation(ctx context.Context, sessionHandle, operationHandle string) (string, error)
+	CloseOperation(ctx context.Context, sessionHandle, operationHandle string) (string, error)
+	GetOperationStatus(ctx context.Context, sessionHandle, operationHandle string) (string, error)
+	ExecuteStatement(ctx context.Context, sessionHandle string, reqBody *ExecuteStatementRequest) (string, error)
+	FetchResults(ctx context.Context, sessionHandle, operationHandle, token string, rowFormat string) (*FetchResultsResponseBody, error)
+}
+
 // Client represents a SQL Gateway REST API client.  It holds the
 // base URL for the Gateway and an underlying http.Client that is used
 // to execute all requests.  Users may set custom timeouts or HTTP
@@ -50,6 +68,8 @@ type Client struct {
 	// Valid values are "v1", "v2" or "v3".  If empty, "v3" is used.
 	APIVersion string
 }
+
+var _ GatewayClient = (*Client)(nil)
 
 // NewClient constructs a new Client for the given baseURL.  The
 // baseURL must be a valid URL string pointing at the SQL Gateway
@@ -435,47 +455,55 @@ func (c *Client) RefreshMaterializedTable(ctx context.Context, sessionHandle, id
 
 // CancelOperation cancels a running operation.  The server will try
 // to terminate the job associated with the operation handle.
-func (c *Client) CancelOperation(ctx context.Context, sessionHandle, operationHandle string) error {
+func (c *Client) CancelOperation(ctx context.Context, sessionHandle, operationHandle string) (string, error) {
 	endpoint, err := c.buildEndpoint("sessions", sessionHandle, "operations", operationHandle, "cancel")
 	if err != nil {
-		return err
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewBufferString("{}"))
 	if err != nil {
-		return err
+		return "nil", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return "nil", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("cancel operation failed: %s", resp.Status)
+	var out OperationStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "nil", err
 	}
-	return nil
+	if resp.StatusCode != http.StatusOK {
+		return "nil", fmt.Errorf("cancel operation failed: %s", resp.Status)
+	}
+	return out.Status, nil
 }
 
 // CloseOperation closes a finished operation.  This should be called
 // after fetching all results to free server-side resources.
-func (c *Client) CloseOperation(ctx context.Context, sessionHandle, operationHandle string) error {
+func (c *Client) CloseOperation(ctx context.Context, sessionHandle, operationHandle string) (string, error) {
 	endpoint, err := c.buildEndpoint("sessions", sessionHandle, "operations", operationHandle)
 	if err != nil {
-		return err
+		return "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, endpoint, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	resp, err := c.do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("close operation failed: %s", resp.Status)
+	var out OperationStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return "", err
 	}
-	return nil
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("close operation failed: %s", resp.Status)
+	}
+	return out.Status, nil
 }
 
 // OperationStatusResponse captures the status of an operation, which
@@ -633,7 +661,6 @@ func (c *Client) ExecuteStatement(ctx context.Context, sessionHandle string, req
 // or map the data into concrete Go types as needed.
 func (c *Client) FetchResults(ctx context.Context, sessionHandle, operationHandle, token string, rowFormat string) (*FetchResultsResponseBody, error) {
 	endpoint, err := c.buildEndpoint("sessions", sessionHandle, "operations", operationHandle, "result", token)
-	log.Printf("[DEBUG] Fetching results from endpoint: %s", endpoint)
 	if err != nil {
 		return nil, err
 	}
@@ -661,20 +688,6 @@ func (c *Client) FetchResults(ctx context.Context, sessionHandle, operationHandl
 		return nil, err
 	}
 
-	// Debug: log response body as JSON if possible
-	{
-		var dbg any
-		if err := json.Unmarshal(bodyBytes, &dbg); err == nil {
-			if _, err := json.MarshalIndent(dbg, "", "  "); err == nil {
-				// log.Printf("[DEBUG] Response body JSON:\n%s", pretty)
-			} else {
-				log.Printf("[DEBUG] Response body (raw): %s", string(bodyBytes))
-			}
-		} else {
-			log.Printf("[DEBUG] Response body (not JSON): %s", string(bodyBytes))
-		}
-	}
-
 	if resp.StatusCode != http.StatusOK {
 		var errPayload struct {
 			Errors []string `json:"errors"`
@@ -689,7 +702,6 @@ func (c *Client) FetchResults(ctx context.Context, sessionHandle, operationHandl
 	if err := json.NewDecoder(bytes.NewReader(bodyBytes)).Decode(&result); err != nil {
 		return nil, err
 	}
-	log.Printf("[DEBUG] FetchResultsResponseBody: %+v", result)
 	return &result, nil
 }
 

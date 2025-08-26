@@ -2,6 +2,7 @@ package flink
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/json"
@@ -66,7 +67,7 @@ func normalizeFlinkType(s string) typeAlias {
 		return decimal
 	case "DATE":
 		return dateType
-	case "TIME":
+	case "TIME", "TIME_WITHOUT_TIME_ZONE":
 		return timeType
 	case "TIMESTAMP", "TIMESTAMP_WITHOUT_TIME_ZONE":
 		return timestamp
@@ -92,11 +93,7 @@ func normalizeFlinkType(s string) typeAlias {
 }
 
 var (
-	scanTypeInt8       = reflect.TypeOf(int8(0))
-	scanTypeInt16      = reflect.TypeOf(int16(0))
-	scanTypeInt32      = reflect.TypeOf(int32(0))
 	scanTypeInt64      = reflect.TypeOf(int64(0))
-	scanTypeFloat32    = reflect.TypeOf(float32(0))
 	scanTypeFloat64    = reflect.TypeOf(float64(0))
 	scanTypeBool       = reflect.TypeOf(true)
 	scanTypeString     = reflect.TypeOf("")
@@ -110,65 +107,50 @@ var (
 )
 
 type Rows struct {
-	iterator iter.Seq[RowData]
-	columns  *[]ColumnInfo
-	closed   bool
+	conn            *flinkConn
+	operationHandle string
+	ctx             context.Context
+	iterator        iter.Seq[RowData]
+	columns         []ColumnInfo
+	closed          bool
 }
 
 func (r *Rows) Columns() []string {
-	names := make([]string, len(*r.columns))
-	for i, c := range *r.columns {
+	names := make([]string, len(r.columns))
+	for i, c := range r.columns {
 		names[i] = c.Name
 	}
 	return names
 }
 
 func (r *Rows) ColumnTypeDatabaseTypeName(index int) string {
-	return strings.ToUpper((*r.columns)[index].LogicalType.Type)
+	return strings.ToUpper((r.columns)[index].LogicalType.Type)
 }
 
 func (r *Rows) RowsColumnTypeNullable(index int) (nullable, ok bool) {
-	return (*r.columns)[index].LogicalType.Nullable, true
+	return (r.columns)[index].LogicalType.Nullable, true
 }
 
 func (r *Rows) Close() error {
-	r.closed = true
-	r.iterator = nil
-	// todo: cancel the underlying operation handle
+	if !r.closed {
+		r.closed = true
+		r.iterator = nil
+		r.conn.client.CancelOperation(r.ctx, r.conn.sessionHandle, r.operationHandle)
+	}
 	return nil
 }
 
 func (r *Rows) ColumnTypeScanType(index int) reflect.Type {
-	nullable := (*r.columns)[index].LogicalType.Nullable
-	t := normalizeFlinkType((*r.columns)[index].LogicalType.Type)
+	nullable := (r.columns)[index].LogicalType.Nullable
+	t := normalizeFlinkType((r.columns)[index].LogicalType.Type)
 
 	switch t {
-	case tinyIntType:
-		if nullable {
-			return scanTypeNullInt
-		}
-		return scanTypeInt8
-	case smallIntType:
-		if nullable {
-			return scanTypeNullInt
-		}
-		return scanTypeInt16
-	case integerType:
-		if nullable {
-			return scanTypeNullInt
-		}
-		return scanTypeInt32
-	case bigIntType, intervalType:
+	case tinyIntType, smallIntType, integerType, bigIntType, intervalType:
 		if nullable {
 			return scanTypeNullInt
 		}
 		return scanTypeInt64
-	case floatType:
-		if nullable {
-			return scanTypeNullFloat
-		}
-		return scanTypeFloat32
-	case doubleType:
+	case floatType, doubleType:
 		if nullable {
 			return scanTypeNullFloat
 		}
@@ -193,13 +175,18 @@ func (r *Rows) ColumnTypeScanType(index int) reflect.Type {
 			return scanTypeNullTime
 		}
 		return scanTypeTime
+	case intervalYearMonthType, intervalDayTimeType:
+		if nullable {
+			return scanTypeNullInt
+		}
+		return scanTypeInt64
 	default:
 		return scanTypeBytes
 	}
 }
 
 func (r *Rows) ColumnTypeLength(index int) (length int64, ok bool) {
-	typeLen := (*r.columns)[index].LogicalType.Length
+	typeLen := (r.columns)[index].LogicalType.Length
 	if typeLen == nil {
 		return 0, false
 	}
@@ -207,7 +194,7 @@ func (r *Rows) ColumnTypeLength(index int) (length int64, ok bool) {
 }
 
 func (r *Rows) columnTypePrecision(index int) (length int, ok bool) {
-	perc := (*r.columns)[index].LogicalType.Precision
+	perc := (r.columns)[index].LogicalType.Precision
 	if perc == nil {
 		return 0, false
 	}
@@ -215,16 +202,209 @@ func (r *Rows) columnTypePrecision(index int) (length int, ok bool) {
 }
 
 func (r *Rows) ColumnTypePrecisionScale(index int) (precision, scale int64, ok bool) {
-	perc := (*r.columns)[index].LogicalType.Precision
-	sc := (*r.columns)[index].LogicalType.Scale
+	perc := (r.columns)[index].LogicalType.Precision
+	sc := (r.columns)[index].LogicalType.Scale
 	if perc == nil || sc == nil {
 		return 0, 0, false
 	}
 	return int64(*perc), int64(*sc), true
 }
 
+func (r *Rows) decodeField(t typeAlias, nullable bool, raw []byte, colIdx int) (driver.Value, error) {
+	isNull := bytes.Equal(raw, []byte("null"))
+
+	switch t {
+	case tinyIntType, smallIntType, integerType, bigIntType, intervalType:
+		if isNull {
+			if nullable {
+				return sql.NullInt64{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var v int64
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("column %d: int decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullInt64{Int64: v, Valid: true}, nil
+		}
+		return v, nil
+
+	case floatType, doubleType:
+		if isNull {
+			if nullable {
+				return sql.NullFloat64{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var v float64
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("column %d: float decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullFloat64{Float64: v, Valid: true}, nil
+		}
+		return v, nil
+
+	case booleanType:
+		if isNull {
+			if nullable {
+				return sql.NullBool{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var v bool
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("column %d: bool decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullBool{Bool: v, Valid: true}, nil
+		}
+		return v, nil
+
+	case charType, varCharType:
+		if isNull {
+			if nullable {
+				return sql.NullString{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var v string
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return nil, fmt.Errorf("column %d: string decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullString{String: v, Valid: true}, nil
+		}
+		return v, nil
+
+	case decimal:
+		if isNull {
+			if nullable {
+				return sql.NullString{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		var num json.Number
+		if err := dec.Decode(&num); err != nil {
+			return nil, fmt.Errorf("column %d: decimal decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullString{String: num.String(), Valid: true}, nil
+		}
+		return num.String(), nil
+
+	case dateType:
+		if isNull {
+			if nullable {
+				return sql.NullTime{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("column %d: date decode failed: %w", colIdx, err)
+		}
+		tval, err := time.Parse("2006-01-02", s)
+		if err != nil {
+			return nil, fmt.Errorf("column %d: date parse failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullTime{Time: tval, Valid: true}, nil
+		}
+		return tval, nil
+
+	case timeType:
+		if isNull {
+			if nullable {
+				return sql.NullTime{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("column %d: time decode failed: %w", colIdx, err)
+		}
+		prec, ok := r.columnTypePrecision(colIdx)
+		if !ok {
+			prec = 0
+		}
+		layout := "15:04:05"
+		if prec > 0 {
+			layout = layout + "." + strings.Repeat("9", int(prec))
+		}
+		tval, err := time.Parse(layout, s)
+		if err != nil {
+			return nil, fmt.Errorf("column %d: time parse failed for %q with precision %d: %w", colIdx, s, prec, err)
+		}
+		if nullable {
+			return sql.NullTime{Time: tval, Valid: true}, nil
+		}
+		return tval, nil
+
+	case timestampWTZType:
+		// Keep raw bytes for WTZ
+		return raw, nil
+
+	case timestamp, timestampLTZType:
+		if isNull {
+			if nullable {
+				return sql.NullTime{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var s string
+		if err := json.Unmarshal(raw, &s); err != nil {
+			return nil, fmt.Errorf("column %d: timestamp decode failed: %w", colIdx, err)
+		}
+		prec, ok := r.columnTypePrecision(colIdx)
+		if !ok {
+			prec = 6
+		}
+		base := "2006-01-02T15:04:05"
+		if prec > 0 {
+			base = base + "." + strings.Repeat("9", int(prec))
+		}
+		layout := base
+		if strings.HasSuffix(s, "Z") {
+			layout = base + "Z"
+		}
+		tval, err := time.Parse(layout, s)
+		if err != nil {
+			return nil, fmt.Errorf("column %d: timestamp parse failed for %q with precision %d using layout %q: %w", colIdx, s, prec, layout, err)
+		}
+		if nullable {
+			return sql.NullTime{Time: tval, Valid: true}, nil
+		}
+		return tval, nil
+
+	case intervalYearMonthType, intervalDayTimeType:
+		if isNull {
+			if nullable {
+				return sql.NullInt64{Valid: false}, nil
+			}
+			return nil, nil
+		}
+		var n int64
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return nil, fmt.Errorf("column %d: interval decode failed: %w", colIdx, err)
+		}
+		if nullable {
+			return sql.NullInt64{Int64: n, Valid: true}, nil
+		}
+		return n, nil
+
+	case arrayType, mapType, rowType, multisetType:
+		return raw, nil
+	default:
+		return raw, nil
+	}
+}
+
 func (r *Rows) Next(dest []driver.Value) error {
-	if r.closed || r.iterator == nil {
+	if r.closed {
 		return io.EOF
 	}
 
@@ -239,117 +419,79 @@ func (r *Rows) Next(dest []driver.Value) error {
 
 	// No more data
 	if !ok {
+		// r.closed = true
 		return io.EOF
 	}
 
 	for i, raw := range row.Fields {
-		t := normalizeFlinkType((*r.columns)[i].LogicalType.Type)
-
-		// handle null explicitly
-		if strings.TrimSpace(string(raw)) == "null" {
-			dest[i] = nil
-			continue
+		t := normalizeFlinkType((r.columns)[i].LogicalType.Type)
+		nullable := (r.columns)[i].LogicalType.Nullable
+		val, err := r.decodeField(t, nullable, raw, i)
+		if err != nil {
+			return err
 		}
-
-		switch t {
-		case tinyIntType, smallIntType, integerType, bigIntType, intervalType:
-			var v int64
-			if err := json.Unmarshal(raw, &v); err != nil {
-				return fmt.Errorf("column %d: int decode failed: %w", i, err)
-			}
-			dest[i] = v
-		case floatType, doubleType:
-			var v float64
-			if err := json.Unmarshal(raw, &v); err != nil {
-				return fmt.Errorf("column %d: float decode failed: %w", i, err)
-			}
-			dest[i] = v
-		case booleanType:
-			var v bool
-			if err := json.Unmarshal(raw, &v); err != nil {
-				return fmt.Errorf("column %d: bool decode failed: %w", i, err)
-			}
-			dest[i] = v
-		case charType, varCharType:
-			var v string
-			if err := json.Unmarshal(raw, &v); err != nil {
-				return fmt.Errorf("column %d: string decode failed: %w", i, err)
-			}
-			dest[i] = v
-		case decimal:
-			dec := json.NewDecoder(bytes.NewReader(raw))
-			dec.UseNumber()
-			var num json.Number
-			if err := dec.Decode(&num); err != nil {
-				return fmt.Errorf("column %d: decimal decode failed: %w", i, err)
-			}
-			// Preserve exact lexical representation to avoid precision loss
-			dest[i] = num.String()
-		case dateType:
-			var s string
-			if err := json.Unmarshal(raw, &s); err != nil {
-				return fmt.Errorf("column %d: date decode failed: %w", i, err)
-			}
-			tval, err := time.Parse("2006-01-02", s)
-			if err != nil {
-				return fmt.Errorf("column %d: date parse failed: %w", i, err)
-			}
-			dest[i] = tval
-		case timeType:
-			var s string
-			if err := json.Unmarshal(raw, &s); err != nil {
-				return fmt.Errorf("column %d: time decode failed: %w", i, err)
-			}
-			prec, ok := r.columnTypePrecision(i)
-			if !ok {
-				prec = 0
-			}
-			layout := "15:04:05"
-			if prec > 0 {
-				layout = layout + "." + strings.Repeat("9", int(prec))
-			}
-			tval, err := time.Parse(layout, s)
-			if err != nil {
-				return fmt.Errorf("column %d: time parse failed for %q with precision %d: %w", i, s, prec, err)
-			}
-			dest[i] = tval
-		case timestampWTZType:
-			dest[i] = []byte(raw)
-		case timestamp, timestampLTZType:
-			var s string
-			if err := json.Unmarshal(raw, &s); err != nil {
-				return fmt.Errorf("column %d: timestamp decode failed: %w", i, err)
-			}
-			prec, ok := r.columnTypePrecision(i)
-			if !ok {
-				prec = 6
-			}
-			base := "2006-01-02T15:04:05"
-			if prec > 0 {
-				base = base + "." + strings.Repeat("9", int(prec))
-			}
-			layout := base
-			if strings.HasSuffix(s, "Z") {
-				layout = base + "Z"
-			}
-
-			tval, err := time.Parse(layout, s)
-			if err != nil {
-				return fmt.Errorf("column %d: timestamp parse failed for %q with precision %d using layout %q: %w", i, s, prec, layout, err)
-			}
-			dest[i] = tval
-		case intervalYearMonthType, intervalDayTimeType:
-			var n int64
-			if err := json.Unmarshal(raw, &n); err != nil {
-				return fmt.Errorf("column %d: interval decode failed: %w", i, err)
-			}
-			dest[i] = n
-		case arrayType, mapType, rowType, multisetType:
-			dest[i] = []byte(raw)
-		default:
-			dest[i] = []byte(raw)
-		}
+		dest[i] = val
 	}
 
 	return nil
+}
+
+func newRows(ctx context.Context, conn *flinkConn, operationHandle string, initialResults []RowData, columns []ColumnInfo, nextToken string) (*Rows, error) {
+	iterator := newResultsIterator(ctx, conn, operationHandle, initialResults, nextToken)
+	return &Rows{
+		conn:            conn,
+		ctx:             ctx,
+		operationHandle: operationHandle,
+		iterator:        iterator,
+		columns:         columns,
+	}, nil
+}
+
+func newResultsIterator(ctx context.Context, conn *flinkConn, operationHandle string, initialResults []RowData, nextToken string) iter.Seq[RowData] {
+	results := initialResults
+	token := nextToken
+	pos := 0
+	client := conn.client
+	sessionHandle := conn.sessionHandle
+
+	return func(yield func(RowData) bool) {
+		baseBackoff := 1 * time.Second
+		backoff := baseBackoff
+		for {
+			if pos < len(results) {
+				row := results[pos]
+				pos++
+				if !yield(row) {
+					return
+				}
+				continue
+			}
+			// todo: fetch next results asynchronously
+			response, err := client.FetchResults(ctx, sessionHandle, operationHandle, token, "")
+			if err != nil {
+				conn.cancelOperation(ctx, operationHandle)
+				return
+			}
+			if response.ResultType == ResultTypeEOS {
+				return
+			}
+			results = response.Results.Data
+			token = response.NextToken()
+			pos = 0
+
+			if len(results) == 0 {
+				select {
+				case <-ctx.Done():
+					conn.cancelOperation(ctx, operationHandle)
+					return
+				case <-time.After(backoff):
+					if backoff < 8*time.Second {
+						backoff *= 2
+					}
+				}
+			} else {
+				backoff = baseBackoff
+			}
+		}
+	}
 }

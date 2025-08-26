@@ -55,8 +55,8 @@ func WithProperties(properties map[string]string) ConnOption {
 }
 
 type connector struct {
-	client *Client
-	cfg    *ConnConfig
+	client GatewayClient
+	config *ConnConfig
 }
 
 // NewConnector creates a connection that can be used with `sql.OpenDB()`.
@@ -70,12 +70,12 @@ func NewConnector(options ...ConnOption) (driver.Connector, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error while creating flink client: %w", err)
 	}
-	return &connector{client: flinkClient, cfg: cfg}, nil
+	return &connector{client: flinkClient, config: cfg}, nil
 }
 
 // Connect returns a new Conn bound to this Connector's client.
 func (c *connector) Connect(ctx context.Context) (driver.Conn, error) {
-	mergedProps, err := mergeProperties(c.cfg.GatewayURL, c.cfg.Properties)
+	mergedProps, err := mergeProperties(c.config.GatewayURL, c.config.Properties)
 	if err != nil {
 		return nil, fmt.Errorf("flink: failed to merge properties: %w", err)
 	}

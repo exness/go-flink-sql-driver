@@ -6,8 +6,8 @@ A lightweight Go driver for the **Apache Flink SQL Gateway**.
 ## Highlights
 - Idiomatic `database/sql` integration (`sql.OpenDB(connector)`).
 - Simple programmatic configuration via `NewConnector(WithGatewayURL(...), WithProperties(...))`.
-- Careful type mapping for Flink → Go types, including **nullable** handling (`sql.Null*`).
-- Ready for streaming queries (context‑driven cancellation/timeouts).
+- Type mapping for Flink → Go types, including **nullable** handling.
+- Supports batch and streaming queries.
 
 ---
 
@@ -19,6 +19,7 @@ package main
 import (
     "context"
     "database/sql"
+	"github.com/exness/go-flink-sql-driver"
     "fmt"
     "log"
     "time"
@@ -78,11 +79,6 @@ Non‑nullable columns map to concrete Go types; nullable columns map to `sql.Nu
 | DATE / TIME / TIMESTAMP | time.Time     | sql.NullTime    |
 | BINARY / VARBINARY      | []byte        | []byte          |
 | ROW / MAP / ARRAY       | []byte        | []byte          |
-
----
-
-## Streaming behavior
-Use contexts to bound your streaming queries. Cancellation or deadline expiration will gracefully end the stream (the driver closes the operation and the gateway cleans up).
 
 ---
 

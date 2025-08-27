@@ -1,5 +1,5 @@
 todo
-# go-flink-sql-gateway
+# go-flink-sql-driver
 
 A lightweight Go driver for the **Apache Flink SQL Gateway**.
 
